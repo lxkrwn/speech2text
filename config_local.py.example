@@ -1,0 +1,14 @@
+"""Шаблон личных переопределений путей.
+
+Скопируйте этот файл в config_local.py (без .example) и укажите свои пути.
+config_local.py не попадает в git — см. .gitignore.
+Если файла config_local.py нет или в нём не задана какая-то из переменных —
+используются базовые папки проекта из config.py (Аудиозаписи/, Транскрипты/,
+terminology.txt).
+"""
+
+from pathlib import Path
+
+# OVERRIDE_INPUT_DIR = Path("/полный/путь/к/папке/с/аудиозаписями")
+# OVERRIDE_OUTPUT_DIR = Path("/полный/путь/к/папке/для/транскриптов")
+# OVERRIDE_TERMINOLOGY_FILE = Path("/полный/путь/к/своему/terminology.txt")

@@ -1,0 +1,16 @@
+.env
+.checkpoints/
+.DS_Store
+
+config_local.py
+
+__pycache__/
+
+*_tmp16k.wav
+Аудиозаписи/
+Аудиозаписи/Архив/
+Транскрипты/
+gigaam-env/
+
+log_user.txt
+log_tech.txt
