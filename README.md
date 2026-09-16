@@ -1,8 +1,10 @@
 # Speech2Text 0.2
 
 Локальная транскрибация русскоязычных записей встреч с разделением по спикерам.
-Всё считается на своём Mac (Apple Silicon, MPS) — записи никуда не отправляются,
-кроме однократного скачивания моделей с Hugging Face.
+Всё считается на своей машине (macOS или Linux) — записи никуда не отправляются,
+кроме однократного скачивания моделей с Hugging Face. На Apple Silicon вычисления
+автоматически ускоряются через Metal (MPS); на Linux (и на Intel-Mac) скрипт
+считает на CPU, если не поставить GPU-сборку PyTorch отдельно (см. «Установка»).
 
 Стек:
 
@@ -35,7 +37,7 @@ Speech2Text 0.2/
 ├── transcribe.py          # основной скрипт: транскрибация + постобработка + ручная очистка
 ├── config.py               # все настройки проекта (папки, модели, формат)
 ├── terminology.txt          # словарь автозамены терминов — редактируется вручную
-├── run_transcribe.command  # запуск в один клик (двойной клик в Finder)
+├── run_transcribe.command  # запуск в один клик (двойной клик в Finder, только macOS)
 ├── requirements.txt        # зависимости Python
 ├── .env                     # токен Hugging Face (не в git)
 ├── .env.example             # шаблон .env
@@ -83,23 +85,62 @@ cp config_local.py.example config_local.py
 
 ## Установка
 
-1. Понадобится Mac на Apple Silicon, Python 3.11, ffmpeg и аккаунт на [huggingface.co](https://huggingface.co).
-2. Создать и активировать виртуальное окружение `gigaam-env`, установить зависимости:
-   ```bash
-   python3.11 -m venv gigaam-env
-   source gigaam-env/bin/activate
-   pip install -r requirements.txt
-   ```
-3. Принять условия доступа к gated-моделям под своим аккаунтом:
-   [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) и
-   [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0).
-4. Скопировать `.env.example` в `.env` и вписать свой read-токен Hugging Face:
-   ```
-   HF_TOKEN=hf_ваш_токен
-   ```
+Понадобится Python 3.11, ffmpeg и аккаунт на [huggingface.co](https://huggingface.co).
+Python 3.12+ не подходит — часть зависимостей GigaAM и pyannote может не собраться.
 
-Подробная пошаговая инструкция (для первой установки) — в
-[Постановка/Транскрибация GigaAM.md](Постановка/Транскрибация%20GigaAM.md).
+### 1. Системные зависимости (Python 3.11 и ffmpeg)
+
+**macOS** (через [Homebrew](https://brew.sh)):
+```bash
+brew install ffmpeg python@3.11
+```
+
+**Linux (Debian/Ubuntu)**:
+```bash
+sudo apt update
+sudo apt install ffmpeg python3.11 python3.11-venv
+```
+
+**Linux (Fedora/RHEL)**:
+```bash
+sudo dnf install ffmpeg python3.11
+```
+(если ffmpeg недоступен из стандартных репозиториев — подключите RPM Fusion
+или поставьте статическую сборку с [ffmpeg.org](https://ffmpeg.org/download.html))
+
+### 2. Виртуальное окружение и зависимости
+
+```bash
+python3.11 -m venv gigaam-env
+source gigaam-env/bin/activate
+pip install -r requirements.txt
+```
+
+На Linux с NVIDIA-видеокартой `requirements.txt` поставит обычную (CPU) сборку
+PyTorch — расчёт пойдёт на процессоре. Чтобы использовать GPU, поставьте
+CUDA-сборку PyTorch **до** `pip install -r requirements.txt`, по инструкции
+[pytorch.org/get-started/locally](https://pytorch.org/get-started/locally/)
+(выбрать Stable → Linux → Pip → CUDA), а затем доустановить остальные
+зависимости из `requirements.txt`. На Apple Silicon отдельно ничего ставить не
+нужно — ускорение через MPS работает из коробки.
+
+### 3. Доступ к моделям pyannote
+
+Принять условия доступа к gated-моделям под своим аккаунтом Hugging Face:
+[pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) и
+[pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0).
+
+### 4. Токен Hugging Face
+
+Скопировать `.env.example` в `.env` и вписать свой read-токен:
+```
+HF_TOKEN=hf_ваш_токен
+```
+
+Подробная пошаговая инструкция для macOS (Homebrew, Automator-ярлык и т.п.) —
+в [Постановка/Транскрибация GigaAM.md](Постановка/Транскрибация%20GigaAM.md);
+для Linux она не актуальна в части системных шагов, но описание самого
+скрипта и словаря замены терминов справедливо для обеих систем.
 
 ## Запуск
 
@@ -111,8 +152,10 @@ source gigaam-env/bin/activate
 python3 transcribe.py
 ```
 
-Либо двойным кликом по `run_transcribe.command`. Можно также обработать
-конкретный файл, указав путь к нему аргументом:
+На macOS можно также запустить двойным кликом по `run_transcribe.command`
+(в Finder) — на Linux это не сработает, там просто используйте команды выше
+или свой shell-скрипт/systemd-юнит. Можно также обработать конкретный файл,
+указав путь к нему аргументом:
 
 ```bash
 python3 transcribe.py /путь/к/файлу.mp4
@@ -147,7 +190,7 @@ python3 transcribe.py --clean входной.md [выходной.md]
 |---|---|
 | `ОШИБКА: не найден HF_TOKEN` | нет `.env` рядом со скриптом или в нём опечатка — должна быть строка `HF_TOKEN=hf_...` |
 | Ошибка доступа к gated-модели | не приняты условия на страницах моделей pyannote под тем же аккаунтом, чей токен в `.env` |
-| `ffmpeg: command not found` | ffmpeg не установлен или не виден в PATH (скрипт сам добавляет пути Homebrew, но сам ffmpeg должен быть установлен: `brew install ffmpeg`) |
+| `ffmpeg: command not found` | ffmpeg не установлен или не виден в PATH. На macOS скрипт сам добавляет пути Homebrew, но сам ffmpeg должен быть установлен (`brew install ffmpeg`); на Linux — `apt install ffmpeg` / `dnf install ffmpeg` |
 | Все реплики свалились в одного спикера | запись велась на один микрофон в переговорке; частично помогает задать `NUM_SPEAKERS` в `config.py` |
 | Текст рвётся на мелкие куски | увеличить `MIN_FLICKER_DURATION` в `config.py` |
 | Не найдено медиафайлов | файл лежит не в `INPUT_DIR` или расширение не входит в `SUPPORTED_EXTENSIONS` |
