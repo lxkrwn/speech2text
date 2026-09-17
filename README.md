@@ -1,11 +1,15 @@
-# Speech2Text 0.2
+# Speech2Text
 
 Локальная транскрибация русскоязычных записей встреч (аудио и видео) с
-разделением по спикерам. Вся обработка идёт на своей машине (macOS или Linux):
-содержимое записи никуда не отправляется (подробнее в разделе «Приватность
-и работа офлайн» ниже). На Apple Silicon вычисления автоматически ускоряются
-через Metal (MPS); на Linux (и на Intel-Mac) скрипт считает на CPU, если не
-поставить GPU-сборку PyTorch отдельно (см. «Установка»).
+разделением по спикерам. Вся обработка идёт на своей машине (macOS, Linux или
+Windows): содержимое записи никуда не отправляется (подробнее в разделе
+«Приватность и работа офлайн» ниже). На Apple Silicon вычисления автоматически
+ускоряются через Metal (MPS); на Linux, Windows и Intel-Mac скрипт считает на
+CPU, если не поставить GPU-сборку PyTorch отдельно (см. «Установка»).
+
+Код кросс-платформенный (пути через `pathlib`, без вызовов, специфичных для
+одной ОС), но на Windows он не тестировался живьём: проверка была только по
+чтению кода и зависимостей. Если что-то пойдёт не так, дай знать.
 
 Стек:
 
@@ -77,6 +81,7 @@ Speech2Text 0.2/
 ├── config.py               # все настройки проекта (папки, модели, формат)
 ├── terminology.txt          # словарь автозамены терминов (редактируется вручную)
 ├── run_transcribe.command  # запуск в один клик (двойной клик в Finder, только macOS)
+├── run_transcribe.bat      # запуск в один клик (двойной клик в Проводнике, только Windows)
 ├── requirements.txt        # зависимости Python
 ├── .env                     # токен Hugging Face (не в git)
 ├── .env.example             # шаблон .env
@@ -147,19 +152,41 @@ sudo dnf install ffmpeg python3.11
 (если ffmpeg недоступен из стандартных репозиториев, подключите RPM Fusion
 или поставьте статическую сборку с [ffmpeg.org](https://ffmpeg.org/download.html))
 
+**Windows**:
+1. Python 3.11 с [python.org/downloads](https://www.python.org/downloads/) (при установке отметить «Add python.exe to PATH») или через winget:
+   ```powershell
+   winget install Python.Python.3.11
+   ```
+2. ffmpeg через winget или [Chocolatey](https://chocolatey.org):
+   ```powershell
+   winget install Gyan.FFmpeg
+   ```
+   (или `choco install ffmpeg`; либо скачать сборку с [ffmpeg.org](https://ffmpeg.org/download.html) и добавить папку `bin` в переменную PATH вручную)
+
 ### 2. Виртуальное окружение и зависимости
 
+**macOS / Linux**:
 ```bash
 python3.11 -m venv gigaam-env
 source gigaam-env/bin/activate
 pip install -r requirements.txt
 ```
 
-На Linux с NVIDIA-видеокартой `requirements.txt` поставит обычную (CPU) сборку
-PyTorch, расчёт пойдёт на процессоре. Чтобы использовать GPU, поставьте
-CUDA-сборку PyTorch **до** `pip install -r requirements.txt`, по инструкции
-[pytorch.org/get-started/locally](https://pytorch.org/get-started/locally/)
-(выбрать Stable → Linux → Pip → CUDA), а затем доустановить остальные
+**Windows** (PowerShell):
+```powershell
+py -3.11 -m venv gigaam-env
+gigaam-env\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+Если PowerShell блокирует запуск скриптов активации, один раз выполните
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. В обычной `cmd.exe`
+активация выглядит как `gigaam-env\Scripts\activate.bat`.
+
+На Linux и Windows с NVIDIA-видеокартой `requirements.txt` может поставить
+обычную (CPU) сборку PyTorch, расчёт пойдёт на процессоре. Чтобы использовать
+GPU, поставьте CUDA-сборку PyTorch **до** `pip install -r requirements.txt`,
+по инструкции [pytorch.org/get-started/locally](https://pytorch.org/get-started/locally/)
+(выбрать Stable → свою ОС → Pip → CUDA), а затем доустановить остальные
 зависимости из `requirements.txt`. На Apple Silicon отдельно ничего ставить не
 нужно: ускорение через MPS работает из коробки.
 
@@ -178,21 +205,29 @@ HF_TOKEN=hf_ваш_токен
 
 Подробная пошаговая инструкция для macOS (Homebrew, Automator-ярлык и т.п.)
 есть в файле [Постановка/Транскрибация GigaAM.md](Постановка/Транскрибация%20GigaAM.md);
-для Linux она не актуальна в части системных шагов, но описание самого
-скрипта и словаря замены терминов справедливо для обеих систем.
+для Linux и Windows она не актуальна в части системных шагов, но описание
+самого скрипта и словаря замены терминов справедливо для всех систем.
 
 ## Запуск
 
 Положить аудио или видео встречи в папку `Аудиозаписи` (или в папку, указанную
 в `config.INPUT_DIR`), затем:
 
+**macOS / Linux**:
 ```bash
 source gigaam-env/bin/activate
 python3 transcribe.py
 ```
 
+**Windows**:
+```powershell
+gigaam-env\Scripts\Activate.ps1
+python transcribe.py
+```
+
 На macOS можно также запустить двойным кликом по `run_transcribe.command`
-(в Finder); на Linux это не сработает, используйте команды выше или свой
+(в Finder), на Windows: двойным кликом по `run_transcribe.bat` (в Проводнике).
+На Linux готового ярлыка нет, используйте команды выше или свой
 shell-скрипт/systemd-юнит. Можно также обработать конкретный файл, указав
 путь к нему аргументом:
 
@@ -229,7 +264,8 @@ python3 transcribe.py --clean входной.md [выходной.md]
 |---|---|
 | `ОШИБКА: не найден HF_TOKEN` | нет `.env` рядом со скриптом или в нём опечатка: должна быть строка `HF_TOKEN=hf_...` |
 | Ошибка доступа к gated-модели | не приняты условия на страницах моделей pyannote под тем же аккаунтом, чей токен в `.env` |
-| `ffmpeg: command not found` | ffmpeg не установлен или не виден в PATH. На macOS скрипт сам добавляет пути Homebrew, но сам ffmpeg должен быть установлен (`brew install ffmpeg`); на Linux используйте `apt install ffmpeg` / `dnf install ffmpeg` |
+| `ffmpeg: command not found` (macOS/Linux) или `'ffmpeg' не является внутренней или внешней командой` (Windows) | ffmpeg не установлен или не виден в PATH. На macOS скрипт сам добавляет пути Homebrew, но сам ffmpeg должен быть установлен (`brew install ffmpeg`); на Linux используйте `apt install ffmpeg` / `dnf install ffmpeg`; на Windows используйте `winget install Gyan.FFmpeg` и перезапустите терминал, чтобы PATH обновился |
+| В консоли Windows кириллица выглядит как «кракозябры» | старая кодовая страница `cmd.exe`. Выполните `chcp 65001` перед запуском (в `run_transcribe.bat` это уже сделано) или используйте Windows Terminal / PowerShell |
 | Все реплики свалились в одного спикера | запись велась на один микрофон в переговорке; частично помогает задать `NUM_SPEAKERS` в `config.py` |
 | Текст рвётся на мелкие куски | увеличить `MIN_FLICKER_DURATION` в `config.py` |
 | Не найдено медиафайлов | файл лежит не в `INPUT_DIR` или расширение не входит в `SUPPORTED_EXTENSIONS` |
