@@ -410,8 +410,8 @@ def write_transcript_markdown(
         "## Транскрипт",
     ]
     lines = [
-        f"**{format_time(segment['start'])}-{format_time(segment['end'])} "
-        f"{segment['speaker']}:** {segment['text']}"
+        f"{format_time(segment['start'])}-{format_time(segment['end'])} "
+        f"{segment['speaker']}: {segment['text']}"
         for segment in segments
     ]
     content = "\n".join(parts)
