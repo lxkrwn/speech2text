@@ -14,7 +14,7 @@ import time
 import traceback
 import wave
 from contextlib import redirect_stderr, redirect_stdout
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, wait as wait_futures
 from datetime import datetime
 from pathlib import Path
 
@@ -30,8 +30,8 @@ from config import (  # noqa: E402
     ASR_MODEL,
     COMMUNITY_MODEL,
     DIARIZATION_MODEL,
+    HEARTBEAT_INTERVAL_SECONDS,
     INPUT_DIR,
-    LONG_FILE_THRESHOLD_SECONDS,
     MIN_FLICKER_DURATION,
     MIN_FLICKER_WORDS,
     NUM_SPEAKERS,
@@ -93,17 +93,39 @@ def convert_to_wav(source: Path) -> Path:
     return wav_path
 
 
-def run_asr(wav_path: str, model_name: str, force_cpu: bool = False):
-    """Run GigaAM in a worker process and return word-level timestamps."""
+def _is_mps_oom(error: Exception) -> bool:
+    return isinstance(error, RuntimeError) and "MPS backend out of memory" in str(error)
+
+
+def run_asr(wav_path: str, model_name: str, force_cpu: bool = False) -> tuple[list, str]:
+    """Run GigaAM in a worker process; return (word-level timestamps, device used).
+
+    Tries MPS first (unless force_cpu). If MPS genuinely runs out of memory,
+    reloads the model fresh on CPU and retries once, instead of failing.
+    """
     import torch
     import gigaam
 
-    with open(os.devnull, "w") as quiet_stream:
-        with redirect_stdout(quiet_stream), redirect_stderr(quiet_stream):
-            model = gigaam.load_model(model_name)
-            if not force_cpu and torch.backends.mps.is_available():
-                model = model.to("mps")
-            result = model.transcribe_longform(wav_path, word_timestamps=True)
+    use_mps = not force_cpu and torch.backends.mps.is_available()
+    device = "mps" if use_mps else "cpu"
+
+    def _run(on_device: str):
+        with open(os.devnull, "w") as quiet_stream:
+            with redirect_stdout(quiet_stream), redirect_stderr(quiet_stream):
+                model = gigaam.load_model(model_name)
+                if on_device == "mps":
+                    model = model.to("mps")
+                return model.transcribe_longform(wav_path, word_timestamps=True)
+
+    try:
+        result = _run(device)
+    except RuntimeError as error:
+        if device == "mps" and _is_mps_oom(error):
+            device = "cpu"
+            result = _run(device)
+        else:
+            raise
+
     words = []
     for segment in result.segments:
         if not segment.words:
@@ -111,7 +133,7 @@ def run_asr(wav_path: str, model_name: str, force_cpu: bool = False):
             continue
         for word in segment.words:
             words.append((float(word.start), float(word.end), word.text))
-    return words
+    return words, device
 
 
 def run_diarization(
@@ -120,26 +142,42 @@ def run_diarization(
     model_name: str,
     num_speakers: int | None,
     force_cpu: bool = False,
-):
-    """Run pyannote in a worker process and return speaker intervals."""
+) -> tuple[list, str]:
+    """Run pyannote in a worker process; return (speaker intervals, device used).
+
+    Tries MPS first (unless force_cpu). If MPS genuinely runs out of memory,
+    reloads the pipeline fresh on CPU and retries once, instead of failing.
+    """
     import torch
     from pyannote.audio import Pipeline
 
-    with open(os.devnull, "w") as quiet_stream:
-        with redirect_stdout(quiet_stream), redirect_stderr(quiet_stream):
-            pipeline = Pipeline.from_pretrained(model_name, token=token)
-            if not force_cpu and torch.backends.mps.is_available():
-                try:
+    use_mps = not force_cpu and torch.backends.mps.is_available()
+    device = "mps" if use_mps else "cpu"
+    options = {"num_speakers": num_speakers} if num_speakers else {}
+
+    def _run(on_device: str):
+        with open(os.devnull, "w") as quiet_stream:
+            with redirect_stdout(quiet_stream), redirect_stderr(quiet_stream):
+                pipeline = Pipeline.from_pretrained(model_name, token=token)
+                if on_device == "mps":
                     pipeline.to(torch.device("mps"))
-                except Exception:
-                    pass
-            options = {"num_speakers": num_speakers} if num_speakers else {}
-            diarization = pipeline(wav_path, **options)
+                return pipeline(wav_path, **options)
+
+    try:
+        diarization = _run(device)
+    except RuntimeError as error:
+        if device == "mps" and _is_mps_oom(error):
+            device = "cpu"
+            diarization = _run(device)
+        else:
+            raise
+
     annotation = getattr(diarization, "speaker_diarization", diarization)
-    return [
+    turns = [
         (turn.start, turn.end, speaker)
         for turn, _, speaker in annotation.itertracks(yield_label=True)
     ]
+    return turns, device
 
 
 def check_diarization_access(token: str) -> None:
@@ -508,53 +546,39 @@ def process_file(
         words = checkpoint.get("words")
         turns = checkpoint.get("turns")
 
-        sequential = duration >= LONG_FILE_THRESHOLD_SECONDS
-        if sequential:
-            log(
-                f"Запись длиннее {LONG_FILE_THRESHOLD_SECONDS / 60:.0f} мин "
-                f"({duration / 60:.0f} мин): GigaAM и pyannote запускаются по "
-                "очереди на CPU (не на MPS), чтобы не упереться в потолок "
-                "памяти видеочипа."
+        log("Запуск GigaAM и pyannote параллельно для недостающих результатов...")
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            asr_future = (
+                executor.submit(run_asr, str(wav_path), ASR_MODEL)
+                if words is None else None
             )
-        else:
-            log("Запуск GigaAM и pyannote параллельно для недостающих результатов...")
+            diarization_future = (
+                executor.submit(
+                    run_diarization, str(wav_path), token, DIARIZATION_MODEL, NUM_SPEAKERS
+                )
+                if turns is None else None
+            )
 
-        if sequential:
-            if words is None:
-                with ProcessPoolExecutor(max_workers=1) as executor:
-                    words = executor.submit(
-                        run_asr, str(wav_path), ASR_MODEL, True
-                    ).result()
+            pending = {f for f in (asr_future, diarization_future) if f is not None}
+            wait_started = time.time()
+            while pending:
+                _done, pending = wait_futures(pending, timeout=HEARTBEAT_INTERVAL_SECONDS)
+                if pending:
+                    log(
+                        f"Ещё считаю... прошло {(time.time() - wait_started) / 60:.0f} мин, "
+                        f"незавершённых шагов: {len(pending)}"
+                    )
+
+            if asr_future is not None:
+                words, asr_device = asr_future.result()
                 checkpoint["words"] = words
                 save_checkpoint(source, checkpoint)
-            if turns is None:
-                with ProcessPoolExecutor(max_workers=1) as executor:
-                    turns = executor.submit(
-                        run_diarization,
-                        str(wav_path), token, DIARIZATION_MODEL, NUM_SPEAKERS, True,
-                    ).result()
+                log(f"Распознавание речи завершено (устройство: {asr_device})")
+            if diarization_future is not None:
+                turns, diarization_device = diarization_future.result()
                 checkpoint["turns"] = turns
                 save_checkpoint(source, checkpoint)
-        else:
-            with ProcessPoolExecutor(max_workers=2) as executor:
-                asr_future = (
-                    executor.submit(run_asr, str(wav_path), ASR_MODEL)
-                    if words is None else None
-                )
-                diarization_future = (
-                    executor.submit(
-                        run_diarization, str(wav_path), token, DIARIZATION_MODEL, NUM_SPEAKERS
-                    )
-                    if turns is None else None
-                )
-                if asr_future is not None:
-                    words = asr_future.result()
-                    checkpoint["words"] = words
-                    save_checkpoint(source, checkpoint)
-                if diarization_future is not None:
-                    turns = diarization_future.result()
-                    checkpoint["turns"] = turns
-                    save_checkpoint(source, checkpoint)
+                log(f"Диаризация завершена (устройство: {diarization_device})")
 
         segments = merge_results(words, turns)
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
