@@ -539,14 +539,14 @@ def process_file(
     print(started_at.strftime("%Y-%m-%d %H:%M:%S"), flush=True)
     log(f"Начало обработки: {source.name}")
     try:
-        log("Конвертация в WAV 16 кГц mono...")
+        log("Конвертация в WAV 16 кГц, моно.")
         wav_path = convert_to_wav(source)
         duration = get_audio_duration(wav_path)
         checkpoint = load_checkpoint(source)
         words = checkpoint.get("words")
         turns = checkpoint.get("turns")
 
-        log("Запуск GigaAM и pyannote параллельно для недостающих результатов...")
+        log("Запуск распознавания речи (GigaAM) и диаризации (pyannote) для недостающих результатов.")
         with ProcessPoolExecutor(max_workers=2) as executor:
             asr_future = (
                 executor.submit(run_asr, str(wav_path), ASR_MODEL)
@@ -565,20 +565,20 @@ def process_file(
                 _done, pending = wait_futures(pending, timeout=HEARTBEAT_INTERVAL_SECONDS)
                 if pending:
                     log(
-                        f"Ещё считаю... прошло {(time.time() - wait_started) / 60:.0f} мин, "
-                        f"незавершённых шагов: {len(pending)}"
+                        f"Обработка продолжается. Прошло {(time.time() - wait_started) / 60:.0f} мин, "
+                        f"не завершено шагов: {len(pending)}."
                     )
 
             if asr_future is not None:
                 words, asr_device = asr_future.result()
                 checkpoint["words"] = words
                 save_checkpoint(source, checkpoint)
-                log(f"Распознавание речи завершено (устройство: {asr_device})")
+                log(f"Распознавание речи завершено. Устройство: {asr_device.upper()}.")
             if diarization_future is not None:
                 turns, diarization_device = diarization_future.result()
                 checkpoint["turns"] = turns
                 save_checkpoint(source, checkpoint)
-                log(f"Диаризация завершена (устройство: {diarization_device})")
+                log(f"Диаризация завершена. Устройство: {diarization_device.upper()}.")
 
         segments = merge_results(words, turns)
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
