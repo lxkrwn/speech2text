@@ -512,9 +512,6 @@ def log(message: str, console: bool = False) -> None:
 
 
 def log_file_header(name: str) -> None:
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with LOG_FILE.open("a", encoding="utf-8") as stream:
-        stream.write("\n")
     log("-" * 50)
     log(f"Файл: {name}")
 
