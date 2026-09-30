@@ -93,7 +93,7 @@ def convert_to_wav(source: Path) -> Path:
     return wav_path
 
 
-def run_asr(wav_path: str, model_name: str):
+def run_asr(wav_path: str, model_name: str, force_cpu: bool = False):
     """Run GigaAM in a worker process and return word-level timestamps."""
     import torch
     import gigaam
@@ -101,7 +101,7 @@ def run_asr(wav_path: str, model_name: str):
     with open(os.devnull, "w") as quiet_stream:
         with redirect_stdout(quiet_stream), redirect_stderr(quiet_stream):
             model = gigaam.load_model(model_name)
-            if torch.backends.mps.is_available():
+            if not force_cpu and torch.backends.mps.is_available():
                 model = model.to("mps")
             result = model.transcribe_longform(wav_path, word_timestamps=True)
     words = []
@@ -114,7 +114,13 @@ def run_asr(wav_path: str, model_name: str):
     return words
 
 
-def run_diarization(wav_path: str, token: str, model_name: str, num_speakers: int | None):
+def run_diarization(
+    wav_path: str,
+    token: str,
+    model_name: str,
+    num_speakers: int | None,
+    force_cpu: bool = False,
+):
     """Run pyannote in a worker process and return speaker intervals."""
     import torch
     from pyannote.audio import Pipeline
@@ -122,7 +128,7 @@ def run_diarization(wav_path: str, token: str, model_name: str, num_speakers: in
     with open(os.devnull, "w") as quiet_stream:
         with redirect_stdout(quiet_stream), redirect_stderr(quiet_stream):
             pipeline = Pipeline.from_pretrained(model_name, token=token)
-            if torch.backends.mps.is_available():
+            if not force_cpu and torch.backends.mps.is_available():
                 try:
                     pipeline.to(torch.device("mps"))
                 except Exception:
@@ -507,7 +513,8 @@ def process_file(
             log(
                 f"Запись длиннее {LONG_FILE_THRESHOLD_SECONDS / 60:.0f} мин "
                 f"({duration / 60:.0f} мин): GigaAM и pyannote запускаются по "
-                "очереди, а не параллельно, чтобы не удваивать пиковую память."
+                "очереди на CPU (не на MPS), чтобы не упереться в потолок "
+                "памяти видеочипа."
             )
         else:
             log("Запуск GigaAM и pyannote параллельно для недостающих результатов...")
@@ -515,13 +522,16 @@ def process_file(
         if sequential:
             if words is None:
                 with ProcessPoolExecutor(max_workers=1) as executor:
-                    words = executor.submit(run_asr, str(wav_path), ASR_MODEL).result()
+                    words = executor.submit(
+                        run_asr, str(wav_path), ASR_MODEL, True
+                    ).result()
                 checkpoint["words"] = words
                 save_checkpoint(source, checkpoint)
             if turns is None:
                 with ProcessPoolExecutor(max_workers=1) as executor:
                     turns = executor.submit(
-                        run_diarization, str(wav_path), token, DIARIZATION_MODEL, NUM_SPEAKERS
+                        run_diarization,
+                        str(wav_path), token, DIARIZATION_MODEL, NUM_SPEAKERS, True,
                     ).result()
                 checkpoint["turns"] = turns
                 save_checkpoint(source, checkpoint)
