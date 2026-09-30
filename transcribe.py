@@ -31,6 +31,7 @@ from config import (  # noqa: E402
     COMMUNITY_MODEL,
     DIARIZATION_MODEL,
     INPUT_DIR,
+    LONG_FILE_THRESHOLD_SECONDS,
     MIN_FLICKER_DURATION,
     MIN_FLICKER_WORDS,
     NUM_SPEAKERS,
@@ -394,16 +395,16 @@ def write_transcript_markdown(
     title, date = meeting_metadata(source)
     speakers = list(dict.fromkeys(segment["speaker"] for segment in segments))
     parts = [
-        f"# {title}",
+        f"**{title}**",
         "",
-        f"- **Дата:** {date}",
-        f"- **Длительность:** {format_time(duration)}",
+        f"**Дата:** {date}",
+        f"**Длительность:** {format_time(duration)}",
         "",
         "## Спикеры",
         *[
-            f"- **{speaker}** — {SPEAKER_NAMES[speaker]}"
+            f"**{speaker}** — {SPEAKER_NAMES[speaker]}"
             if SPEAKER_NAMES.get(speaker)
-            else f"- **{speaker}**"
+            else f"**{speaker}**"
             for speaker in speakers
         ],
         "",
@@ -496,36 +497,61 @@ def process_file(
     try:
         log("Конвертация в WAV 16 кГц mono...")
         wav_path = convert_to_wav(source)
+        duration = get_audio_duration(wav_path)
         checkpoint = load_checkpoint(source)
         words = checkpoint.get("words")
         turns = checkpoint.get("turns")
-        log("Запуск GigaAM и pyannote для недостающих результатов...")
-        with ProcessPoolExecutor(max_workers=2) as executor:
-            asr_future = (
-                executor.submit(run_asr, str(wav_path), ASR_MODEL)
-                if words is None else None
+
+        sequential = duration >= LONG_FILE_THRESHOLD_SECONDS
+        if sequential:
+            log(
+                f"Запись длиннее {LONG_FILE_THRESHOLD_SECONDS / 60:.0f} мин "
+                f"({duration / 60:.0f} мин): GigaAM и pyannote запускаются по "
+                "очереди, а не параллельно, чтобы не удваивать пиковую память."
             )
-            diarization_future = (
-                executor.submit(
-                    run_diarization, str(wav_path), token, DIARIZATION_MODEL, NUM_SPEAKERS
-                )
-                if turns is None else None
-            )
-            if asr_future is not None:
-                words = asr_future.result()
+        else:
+            log("Запуск GigaAM и pyannote параллельно для недостающих результатов...")
+
+        if sequential:
+            if words is None:
+                with ProcessPoolExecutor(max_workers=1) as executor:
+                    words = executor.submit(run_asr, str(wav_path), ASR_MODEL).result()
                 checkpoint["words"] = words
                 save_checkpoint(source, checkpoint)
-            if diarization_future is not None:
-                turns = diarization_future.result()
+            if turns is None:
+                with ProcessPoolExecutor(max_workers=1) as executor:
+                    turns = executor.submit(
+                        run_diarization, str(wav_path), token, DIARIZATION_MODEL, NUM_SPEAKERS
+                    ).result()
                 checkpoint["turns"] = turns
                 save_checkpoint(source, checkpoint)
+        else:
+            with ProcessPoolExecutor(max_workers=2) as executor:
+                asr_future = (
+                    executor.submit(run_asr, str(wav_path), ASR_MODEL)
+                    if words is None else None
+                )
+                diarization_future = (
+                    executor.submit(
+                        run_diarization, str(wav_path), token, DIARIZATION_MODEL, NUM_SPEAKERS
+                    )
+                    if turns is None else None
+                )
+                if asr_future is not None:
+                    words = asr_future.result()
+                    checkpoint["words"] = words
+                    save_checkpoint(source, checkpoint)
+                if diarization_future is not None:
+                    turns = diarization_future.result()
+                    checkpoint["turns"] = turns
+                    save_checkpoint(source, checkpoint)
 
         segments = merge_results(words, turns)
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d %H-%M")
         extension = "md" if OUTPUT_FORMAT == "md" else "txt"
         output_path = OUTPUT_DIR / f"{source.stem} {timestamp}.{extension}"
-        write_transcript(segments, output_path, source, get_audio_duration(wav_path))
+        write_transcript(segments, output_path, source, duration)
         cleaned_path, replaced_count, flagged_count = clean_file(
             output_path, output_path, replacements, flags
         )
