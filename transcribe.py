@@ -511,6 +511,14 @@ def log(message: str, console: bool = False) -> None:
         print(message, flush=True)
 
 
+def log_file_header(name: str) -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("a", encoding="utf-8") as stream:
+        stream.write("\n")
+    log("-" * 50)
+    log(f"Файл: {name}")
+
+
 def log_processing_record(
     source: Path, started_at: datetime, finished_at: datetime, elapsed: float
 ) -> None:
@@ -537,7 +545,8 @@ def process_file(
     wav_path: Path | None = None
     print(f"[{index}/{total}] {source.name}", flush=True)
     print(started_at.strftime("%Y-%m-%d %H:%M:%S"), flush=True)
-    log(f"Начало обработки: {source.name}")
+    log_file_header(source.name)
+    log("Начало обработки")
     try:
         log("Конвертация в WAV 16 кГц, моно.")
         wav_path = convert_to_wav(source)
@@ -559,15 +568,18 @@ def process_file(
                 if turns is None else None
             )
 
-            pending = {f for f in (asr_future, diarization_future) if f is not None}
-            wait_started = time.time()
+            step_names = {}
+            if asr_future is not None:
+                step_names[asr_future] = "распознавание речи"
+            if diarization_future is not None:
+                step_names[diarization_future] = "диаризация"
+
+            pending = set(step_names)
             while pending:
                 _done, pending = wait_futures(pending, timeout=HEARTBEAT_INTERVAL_SECONDS)
-                if pending:
-                    log(
-                        f"Обработка продолжается. Прошло {(time.time() - wait_started) / 60:.0f} мин, "
-                        f"не завершено шагов: {len(pending)}."
-                    )
+                for future in step_names:
+                    if future in pending:
+                        log(f"Выполняется: {step_names[future]}.")
 
             if asr_future is not None:
                 words, asr_device = asr_future.result()
