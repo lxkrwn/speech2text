@@ -11,8 +11,14 @@ __pycache__/
 Записи/Архив/
 Транскрипты/
 Постановка/
-
+Архив/
 gigaam-env/
+status/
 
 log_user.txt
 log_tech.txt
+log_tech*.txt
+
+# Локальные заметки проекта, в git только README
+/*.md
+!README.md

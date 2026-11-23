@@ -18,39 +18,48 @@ from concurrent.futures import ProcessPoolExecutor, wait as wait_futures
 from datetime import datetime
 from pathlib import Path
 
-# Automator may not load the shell profile, so include common Homebrew paths.
-for extra_path in ("/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"):
-    if extra_path not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = extra_path + os.pathsep + os.environ.get("PATH", "")
-
-# ---------- SETTINGS (see config.py) ----------
+# ---------- SETTINGS (see config.py, constants.py) ----------
 
 from config import (  # noqa: E402
     ARCHIVE_DIR,
     ASR_MODEL,
     COMMUNITY_MODEL,
     DIARIZATION_MODEL,
+    DOMINANT_SPEAKER_SHARE,
     HEARTBEAT_INTERVAL_SECONDS,
     INPUT_DIR,
     MIN_FLICKER_DURATION,
     MIN_FLICKER_WORDS,
+    MIN_SECOND_SPEAKER_SHARE,
+    MIN_SPEAKER_SHARE,
     NUM_SPEAKERS,
     OUTPUT_DIR,
     OUTPUT_FORMAT,
     PROJECT_DIR,
+    RETRY_SPEAKERS,
     SEGMENTATION_MODEL,
     SPEAKER_NAMES,
     SUPPORTED_EXTENSIONS,
     TERMINOLOGY_FILE,
 )
+from constants import (  # noqa: E402
+    CHECKPOINT_DIR,
+    ENV_FILE,
+    EXTRA_PATH_DIRS,
+    LOG_FILE,
+    PROCESSING_LOG_FILE,
+    TMP_WAV_SUFFIX,
+    SPEAKER_LABEL_PREFIX,
+    UNKNOWN_SPEAKER,
+)
+
+# Automator may not load the shell profile, so include common Homebrew paths.
+for extra_path in EXTRA_PATH_DIRS:
+    if extra_path not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = extra_path + os.pathsep + os.environ.get("PATH", "")
 
 Replacement = tuple[str, str, str]
 Flag = tuple[str, str]
-
-ENV_FILE = PROJECT_DIR / ".env"
-LOG_FILE = PROJECT_DIR / "log_tech.txt"
-PROCESSING_LOG_FILE = PROJECT_DIR / "log_user.txt"
-CHECKPOINT_DIR = PROJECT_DIR / ".checkpoints"
 
 
 def load_env() -> None:
@@ -66,18 +75,25 @@ def load_env() -> None:
         os.environ[key.strip()] = value
 
 
+def is_temp_wav(path: Path) -> bool:
+    """Временный WAV конвертации — не исходник для очереди."""
+    return path.name.endswith(TMP_WAV_SUFFIX)
+
+
 def find_input_files() -> list[Path]:
     if not INPUT_DIR.exists():
         return []
     return sorted(
         path
         for path in INPUT_DIR.iterdir()
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        if path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        and not is_temp_wav(path)
     )
 
 
 def convert_to_wav(source: Path) -> Path:
-    wav_path = source.with_name(f"_{source.stem}_tmp16k.wav")
+    wav_path = source.with_name(f"_{source.stem}{TMP_WAV_SUFFIX}")
     command = [
         "ffmpeg", "-y", "-i", str(source),
         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav_path),
@@ -205,8 +221,100 @@ def check_diarization_access(token: str) -> None:
             ) from error
 
 
+def speaker_shares(turns) -> dict[str, float]:
+    """Share of total speech time per speaker (0..1), largest first."""
+    totals: dict[str, float] = {}
+    for start, end, speaker in turns:
+        totals[speaker] = totals.get(speaker, 0.0) + (end - start)
+    overall = sum(totals.values())
+    if not overall:
+        return {}
+    return dict(sorted(
+        ((speaker, total / overall) for speaker, total in totals.items()),
+        key=lambda item: -item[1],
+    ))
+
+
+def format_shares(shares: dict[str, float]) -> str:
+    return ", ".join(f"{speaker} {share * 100:.1f}%" for speaker, share in shares.items())
+
+
+def merge_minor_speakers(turns, minor: set[str]):
+    """Give turns of minor speakers to the nearest (in time) non-minor speaker."""
+    kept = [turn for turn in turns if turn[2] not in minor]
+    if not kept:
+        return turns
+    result = []
+    for start, end, speaker in turns:
+        if speaker in minor:
+            middle = (start + end) / 2
+            speaker = min(
+                kept, key=lambda turn: max(turn[0] - middle, middle - turn[1], 0.0)
+            )[2]
+        result.append((start, end, speaker))
+    return result
+
+
+def review_speakers(turns, wav_path: Path, token: str, executor):
+    """Sanity-check the speaker count and fix the two known failure modes.
+
+    1. One speaker has almost all the speech: re-run with RETRY_SPEAKERS
+       clusters (spare clusters let close voices separate), merge tiny ones
+       and accept the result only if a real second speaker remains.
+    2. Tiny speakers (noise clusters) are merged into the nearest real speaker.
+    """
+    if NUM_SPEAKERS:
+        return turns
+    shares = speaker_shares(turns)
+    if not shares:
+        return turns
+
+    top_share = next(iter(shares.values()))
+    if top_share >= DOMINANT_SPEAKER_SHARE:
+        log(
+            f"Проверка спикеров: один спикер занимает {top_share * 100:.1f}% речи, "
+            f"пересчёт с {RETRY_SPEAKERS} спикерами."
+        )
+        try:
+            retry_turns, _device = executor.submit(
+                run_diarization, str(wav_path), token, DIARIZATION_MODEL, RETRY_SPEAKERS
+            ).result()
+        except Exception as error:  # the check is optional, never fail the file
+            log(f"Проверка спикеров: пересчёт не удался, оставлен исходный результат ({error}).")
+        else:
+            retry_shares = speaker_shares(retry_turns)
+            retry_minor = {s for s, share in retry_shares.items() if share < MIN_SPEAKER_SHARE}
+            if retry_minor and len(retry_minor) < len(retry_shares):
+                retry_turns = merge_minor_speakers(retry_turns, retry_minor)
+                retry_shares = speaker_shares(retry_turns)
+            second_share = list(retry_shares.values())[1] if len(retry_shares) > 1 else 0.0
+            if second_share >= MIN_SECOND_SPEAKER_SHARE:
+                log(
+                    f"Проверка спикеров: принято {len(retry_shares)} спикеров. "
+                    f"Доли: {format_shares(retry_shares)}."
+                )
+                return retry_turns
+            log(
+                f"Проверка спикеров: второй спикер занимает {second_share * 100:.1f}% "
+                f"(порог {MIN_SECOND_SPEAKER_SHARE * 100:.0f}%), оставлен исходный результат."
+            )
+
+    minor = {speaker for speaker, share in shares.items() if share < MIN_SPEAKER_SHARE}
+    if minor and len(minor) < len(shares):
+        merged = merge_minor_speakers(turns, minor)
+        log(
+            f"Проверка спикеров: слито {len(minor)} спикеров с долей меньше "
+            f"{MIN_SPEAKER_SHARE * 100:.0f}%, осталось {len(shares) - len(minor)}. "
+            f"Доли до слияния: {format_shares(shares)}."
+        )
+        return merged
+
+    log(f"Проверка спикеров: изменений нет. Доли: {format_shares(shares)}.")
+    return turns
+
+
 def assign_speaker(start: float, end: float, turns) -> str:
-    best_speaker = "Неизвестно"
+    best_speaker = UNKNOWN_SPEAKER
     best_overlap = 0.0
     for turn_start, turn_end, speaker in turns:
         overlap = min(end, turn_end) - max(start, turn_start)
@@ -274,7 +382,7 @@ def merge_results(words, turns) -> list[dict]:
     for run in merged_runs:
         raw_speaker = run["speaker"]
         if raw_speaker not in speaker_map:
-            speaker_map[raw_speaker] = f"Спикер {len(speaker_map) + 1}"
+            speaker_map[raw_speaker] = f"{SPEAKER_LABEL_PREFIX} {len(speaker_map) + 1}"
         result.append({
             "speaker": speaker_map[raw_speaker],
             "start": run["start"],
@@ -439,29 +547,30 @@ def write_transcript_markdown(
     title, date = meeting_metadata(source)
     speakers = list(dict.fromkeys(segment["speaker"] for segment in segments))
     parts = [
-        f"**{title}**",
+        "# Встреча",
+        "Проект:",
+        f"Название: {title}",
+        f"Дата: {date}",
+        f"Длительность: {format_time(duration)}",
         "",
-        f"**Дата:** {date}",
-        f"**Длительность:** {format_time(duration)}",
-        "",
-        "## Спикеры",
+        "# Спикеры",
         *[
-            f"**{speaker}** — {SPEAKER_NAMES[speaker]}"
+            f"{speaker} — {SPEAKER_NAMES[speaker]}"
             if SPEAKER_NAMES.get(speaker)
-            else f"**{speaker}**"
+            else speaker
             for speaker in speakers
         ],
         "",
-        "## Транскрипт",
+        "# Транскрипт",
     ]
     lines = [
-        f"{format_time(segment['start'])}-{format_time(segment['end'])} "
-        f"{segment['speaker']}: {segment['text']}"
+        f"**{format_time(segment['start'])}-{format_time(segment['end'])} "
+        f"{segment['speaker']}**: {segment['text']}"
         for segment in segments
     ]
     content = "\n".join(parts)
     if lines:
-        content += "\n\n" + "\n\n".join(lines)
+        content += "\n" + "\n\n".join(lines)
     output_path.write_text(content.rstrip("\n") + "\n", encoding="utf-8")
 
 
@@ -552,7 +661,7 @@ def process_file(
         words = checkpoint.get("words")
         turns = checkpoint.get("turns")
 
-        log("Запуск распознавания речи (GigaAM) и диаризации (pyannote) для недостающих результатов.")
+        log("Запуск транскрибации")
         with ProcessPoolExecutor(max_workers=2) as executor:
             asr_future = (
                 executor.submit(run_asr, str(wav_path), ASR_MODEL)
@@ -571,23 +680,25 @@ def process_file(
             if diarization_future is not None:
                 step_names[diarization_future] = "диаризация"
 
+            transcribe_started = time.monotonic()
             pending = set(step_names)
             while pending:
                 _done, pending = wait_futures(pending, timeout=HEARTBEAT_INTERVAL_SECONDS)
-                for future in step_names:
-                    if future in pending:
-                        log(f"Выполняется: {step_names[future]}.")
+                if pending:
+                    elapsed = int((time.monotonic() - transcribe_started) // 60)
+                    log(f"Выполняется транскрибация (идёт {elapsed} мин)")
 
             if asr_future is not None:
                 words, asr_device = asr_future.result()
                 checkpoint["words"] = words
                 save_checkpoint(source, checkpoint)
-                log(f"Распознавание речи завершено. Устройство: {asr_device.upper()}.")
+                log(f"Завершено распознавание речи. Устройство {asr_device.upper()}.")
             if diarization_future is not None:
                 turns, diarization_device = diarization_future.result()
+                turns = review_speakers(turns, wav_path, token, executor)
                 checkpoint["turns"] = turns
                 save_checkpoint(source, checkpoint)
-                log(f"Диаризация завершена. Устройство: {diarization_device.upper()}.")
+                log(f"Завершена диаризация. Устройство {diarization_device.upper()}.")
 
         segments = merge_results(words, turns)
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -603,16 +714,7 @@ def process_file(
         elapsed = time.time() - started
         finished_at = datetime.now()
         log_processing_record(source, started_at, finished_at, elapsed)
-        archive_note = (
-            f"уже был в архиве ({archive_path}), исходник удалён"
-            if was_duplicate
-            else f"исходник перемещён в {archive_path}"
-        )
-        log(
-            f"Готово: {output_path.name}; очищенный текст: {cleaned_path.name}; "
-            f"{archive_note}; "
-            f"время {elapsed / 60:.1f} мин"
-        )
+        log("Завершена обработка")
         print(
             f"{finished_at.strftime('%Y-%m-%d %H:%M:%S')} | "
             f"{format_time(elapsed)} | Автозамены {replaced_count} | "
